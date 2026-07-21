@@ -1,0 +1,6 @@
+# Calibrex Linux Requirements
+# Python 3.8+ with Tkinter (usually included with Python)
+# No additional pip dependencies required
+
+# Optional: For development/testing
+# pytest>=6.0.0
