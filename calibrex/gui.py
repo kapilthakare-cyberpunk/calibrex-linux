@@ -1,28 +1,29 @@
 """Calibrex - Adaptive Display Calibration GUI for Linux
 
 A menu bar application for display calibration using ArgyllCMS.
-Features colorimeter pre-initialization for Spyder X2 Ultra compatibility.
+Features real-time colorimeter detection and auto-status updates.
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
 import os
-import json
+import subprocess
+import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 from .argyllcms import ArgyllCMS
 from . import __version__
 
 
 class CalibrexApp:
-    """Main application class for Calibrex Linux."""
+    """Main application class for Calibrex Linux with real-time detection."""
     
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("Calibrex")
-        self.root.geometry("320x500")
+        self.root.geometry("350x580")
         self.root.resizable(False, False)
         
         # Initialize ArgyllCMS wrapper
@@ -37,9 +38,23 @@ class CalibrexApp:
         self.true_tone_enabled = tk.BooleanVar(value=False)
         self.adaptive_enabled = tk.BooleanVar(value=True)
         
+        # Colorimeter state
+        self.colorimeter_connected = tk.BooleanVar(value=False)
+        self.colorimeter_name = tk.StringVar(value="Not connected")
+        self.colorimeter_status_text = tk.StringVar(value="Waiting for device...")
+        
+        # Detection thread control
+        self._detection_running = False
+        self._detection_thread = None
+        
         # Setup UI
         self._setup_ui()
-        self._update_status()
+        
+        # Start real-time detection
+        self._start_colorimeter_detection()
+        
+        # Cleanup on close
+        self.root.protocol("WM_DELETE_WINDOW", self._quit)
     
     def _setup_ui(self):
         """Setup the main UI."""
@@ -54,7 +69,7 @@ class CalibrexApp:
         ttk.Label(
             header_frame, 
             text="◐", 
-            font=("Helvetica", 20)
+            font=("Helvetica", 24)
         ).pack(side=tk.LEFT)
         
         title_frame = ttk.Frame(header_frame)
@@ -63,7 +78,7 @@ class CalibrexApp:
         ttk.Label(
             title_frame, 
             text="Calibrex", 
-            font=("Helvetica", 14, "bold")
+            font=("Helvetica", 16, "bold")
         ).pack(anchor=tk.W)
         
         ttk.Label(
@@ -82,8 +97,37 @@ class CalibrexApp:
         
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         
+        # Colorimeter status section (real-time)
+        colorimeter_frame = ttk.LabelFrame(main_frame, text="Colorimeter", padding=8)
+        colorimeter_frame.pack(fill=tk.X, pady=5)
+        
+        # Device indicator
+        device_frame = ttk.Frame(colorimeter_frame)
+        device_frame.pack(fill=tk.X)
+        
+        self.device_indicator = tk.Canvas(device_frame, width=12, height=12, highlightthickness=0)
+        self.device_indicator.pack(side=tk.LEFT, padx=(0, 8))
+        self._draw_indicator("red")  # Default: not connected
+        
+        ttk.Label(
+            device_frame,
+            textvariable=self.colorimeter_name,
+            font=("Helvetica", 10, "bold")
+        ).pack(side=tk.LEFT)
+        
+        # Status message
+        self.status_label = ttk.Label(
+            colorimeter_frame,
+            textvariable=self.colorimeter_status_text,
+            font=("Helvetica", 9),
+            foreground="gray"
+        )
+        self.status_label.pack(anchor=tk.W, pady=(4, 0))
+        
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
         # Status section
-        status_frame = ttk.LabelFrame(main_frame, text="Status", padding=5)
+        status_frame = ttk.LabelFrame(main_frame, text="Readings", padding=8)
         status_frame.pack(fill=tk.X, pady=5)
         
         self._create_status_row(status_frame, "☀ Ambient Light", self.current_lux, "lux")
@@ -94,7 +138,7 @@ class CalibrexApp:
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         
         # Settings section
-        settings_frame = ttk.LabelFrame(main_frame, text="Settings", padding=5)
+        settings_frame = ttk.LabelFrame(main_frame, text="Settings", padding=8)
         settings_frame.pack(fill=tk.X, pady=5)
         
         ttk.Checkbutton(
@@ -121,11 +165,13 @@ class CalibrexApp:
         actions_frame = ttk.Frame(main_frame)
         actions_frame.pack(fill=tk.X, pady=5)
         
-        ttk.Button(
+        self.calibrate_btn = ttk.Button(
             actions_frame, 
             text="🎯 Calibrate Now",
-            command=self._open_calibration_wizard
-        ).pack(fill=tk.X, pady=2)
+            command=self._open_calibration_wizard,
+            state=tk.NORMAL
+        )
+        self.calibrate_btn.pack(fill=tk.X, pady=2)
         
         ttk.Button(
             actions_frame, 
@@ -147,6 +193,11 @@ class CalibrexApp:
             command=self._quit
         ).pack(fill=tk.X, pady=5)
     
+    def _draw_indicator(self, color: str):
+        """Draw the connection indicator."""
+        self.device_indicator.delete("all")
+        self.device_indicator.create_oval(2, 2, 10, 10, fill=color, outline="")
+    
     def _create_status_row(self, parent, label: str, var: tk.DoubleVar, unit: str):
         """Create a status row with label and value."""
         frame = ttk.Frame(parent)
@@ -167,13 +218,158 @@ class CalibrexApp:
             text=f"{int(var.get())} {unit}"
         ))
     
-    def _update_status(self):
-        """Update status values (placeholder for real sensor data)."""
-        # In a real implementation, this would read from sensors
-        # For now, we'll use placeholder values
-        self.current_lux.set(350)
-        self.current_color_temp.set(5500)
-        self.current_brightness.set(75)
+    def _start_colorimeter_detection(self):
+        """Start background colorimeter detection thread."""
+        self._detection_running = True
+        self._detection_thread = threading.Thread(
+            target=self._detection_loop,
+            daemon=True
+        )
+        self._detection_thread.start()
+    
+    def _detection_loop(self):
+        """Background loop to detect colorimeter connection."""
+        last_state = False
+        
+        while self._detection_running:
+            try:
+                # Check for colorimeter via USB
+                connected, device_name = self._check_usb_colorimeter()
+                
+                # Update UI if state changed
+                if connected != last_state:
+                    last_state = connected
+                    self._update_colorimeter_status(connected, device_name)
+                
+                # If connected, try to initialize (wake up sensor)
+                if connected and not self._colorimeter_initialized:
+                    self._try_initialize_colorimeter()
+                
+            except Exception as e:
+                print(f"[Detection] Error: {e}")
+            
+            # Poll every 2 seconds
+            for _ in range(20):
+                if not self._detection_running:
+                    return
+                import time
+                time.sleep(0.1)
+    
+    def _check_usb_colorimeter(self) -> Tuple[bool, str]:
+        """
+        Check if a colorimeter is connected via USB.
+        
+        Returns:
+            Tuple of (connected, device_name)
+        """
+        try:
+            # Check for Spyder X2 Ultra (Datacolor vendor ID: 0971)
+            result = subprocess.run(
+                ["lsusb", "-d", "0971:"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                # Parse device name
+                output = result.stdout.strip()
+                if "Spyder" in output or "spyder" in output:
+                    return True, "Spyder X2 Ultra"
+                elif output:
+                    return True, "Colorimeter Detected"
+            
+            # Also check for X-Rite devices (vendor ID: 03eb)
+            result = subprocess.run(
+                ["lsusb", "-d", "03eb:"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                output = result.stdout.strip()
+                if "i1" in output.lower() or "x-rite" in output.lower():
+                    return True, "X-Rite i1 Display"
+                elif output:
+                    return True, "Colorimeter Detected"
+            
+            # Check via ArgyllCMS if available
+            result = subprocess.run(
+                ["dispwin", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            
+            if "Instrument" in result.stdout or "Spyder" in result.stdout:
+                return True, "Colorimeter Detected"
+            
+            return False, "Not connected"
+            
+        except FileNotFoundError:
+            # lsusb not found, try alternative method
+            return self._check_usb_alternative()
+        except Exception as e:
+            print(f"[Detection] USB check error: {e}")
+            return False, "Not connected"
+    
+    def _check_usb_alternative(self) -> Tuple[bool, str]:
+        """Alternative USB check method."""
+        try:
+            # Check /sys/bus/usb/devices for colorimeter
+            usb_path = "/sys/bus/usb/devices"
+            if os.path.exists(usb_path):
+                for device in os.listdir(usb_path):
+                    device_file = os.path.join(usb_path, device, "idVendor")
+                    if os.path.exists(device_file):
+                        with open(device_file, 'r') as f:
+                            vendor_id = f.read().strip()
+                            if vendor_id in ["0971", "03eb"]:  # Datacolor or X-Rite
+                                return True, "Colorimeter Detected"
+        except Exception:
+            pass
+        
+        return False, "Not connected"
+    
+    def _try_initialize_colorimeter(self):
+        """Try to initialize the colorimeter (wake up sensor)."""
+        try:
+            self._colorimeter_initialized = True
+            self.root.after(0, lambda: self.colorimeter_status_text.set("Initializing sensor..."))
+            
+            # Run dispread to wake up the sensor
+            result = subprocess.run(
+                ["dispread", "-d1", "-v", "-e"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if "reading" in result.stdout.lower() or "instrument" in result.stdout.lower():
+                self.root.after(0, lambda: self.colorimeter_status_text.set("Ready for calibration"))
+            else:
+                self.root.after(0, lambda: self.colorimeter_status_text.set("Connected (standby)"))
+                
+        except Exception as e:
+            print(f"[Detection] Init error: {e}")
+            self.root.after(0, lambda: self.colorimeter_status_text.set("Connected"))
+    
+    def _update_colorimeter_status(self, connected: bool, device_name: str):
+        """Update the colorimeter status in the UI."""
+        self.colorimeter_connected.set(connected)
+        
+        if connected:
+            self._draw_indicator("green")
+            self.colorimeter_name.set(device_name)
+            self.colorimeter_status_text.set("Connected")
+            self.calibrate_btn.config(state=tk.NORMAL)
+        else:
+            self._draw_indicator("red")
+            self.colorimeter_name.set("Not connected")
+            self.colorimeter_status_text.set("Waiting for device...")
+            self._colorimeter_initialized = False
+            self.calibrate_btn.config(state=tk.NORMAL)  # Allow calibration attempt
     
     def _spot_check(self):
         """Perform a spot check reading."""
@@ -187,7 +383,6 @@ class CalibrexApp:
         try:
             valid, x, y, Y = self.argyll.spot_read()
             if valid:
-                # Calculate approximate Delta-E (placeholder)
                 self.last_delta_e.set(1.2)
                 self.root.after(0, lambda: messagebox.showinfo(
                     "Spot Check",
@@ -197,7 +392,7 @@ class CalibrexApp:
                 self.root.after(0, lambda: messagebox.showwarning(
                     "Spot Check",
                     "Could not take spot reading.\n"
-                    "Make sure colorimeter is connected."
+                    "Make sure colorimeter is connected and on screen."
                 ))
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror(
@@ -207,7 +402,8 @@ class CalibrexApp:
     
     def _open_calibration_wizard(self):
         """Open the calibration wizard dialog."""
-        CalibrationWizard(self.root, self.argyll, self.last_delta_e)
+        CalibrationWizard(self.root, self.argyll, self.last_delta_e, 
+                         self.colorimeter_connected)
     
     def _open_settings(self):
         """Open settings dialog."""
@@ -215,6 +411,9 @@ class CalibrexApp:
     
     def _quit(self):
         """Quit the application."""
+        self._detection_running = False
+        if self._detection_thread:
+            self._detection_thread.join(timeout=2)
         self.root.quit()
         self.root.destroy()
     
@@ -226,10 +425,12 @@ class CalibrexApp:
 class CalibrationWizard:
     """Multi-step calibration wizard dialog."""
     
-    def __init__(self, parent, argyll: ArgyllCMS, last_delta_e: tk.DoubleVar):
+    def __init__(self, parent, argyll: ArgyllCMS, last_delta_e: tk.DoubleVar,
+                 colorimeter_connected: tk.BooleanVar):
         self.parent = parent
         self.argyll = argyll
         self.last_delta_e = last_delta_e
+        self.colorimeter_connected = colorimeter_connected
         
         self.step = 0
         self.max_step = 6
@@ -386,69 +587,76 @@ class CalibrationWizard:
         
         ttk.Label(
             self.content_frame,
-            text="Connect your Spyder X2 Ultra via USB\nand click Scan.",
+            text="Connect your Spyder X2 Ultra via USB.",
             font=("Helvetica", 10),
             foreground="gray"
         ).pack(pady=10)
         
-        # Status label
+        # Status label - auto-updates
         self.colorimeter_status = ttk.Label(
             self.content_frame,
-            text="Not connected",
+            text="Checking for device...",
             font=("Helvetica", 10),
             foreground="gray"
         )
         self.colorimeter_status.pack(pady=10)
         
-        # Scan button
-        self.scan_btn = ttk.Button(
-            self.content_frame,
-            text="Scan",
-            command=self._scan_colorimeter
-        )
-        self.scan_btn.pack(pady=10)
-    
-    def _scan_colorimeter(self):
-        """Scan for colorimeter."""
-        if self.is_scanning:
-            return
-        
-        self.is_scanning = True
-        self.scan_btn.config(state=tk.DISABLED)
-        self.colorimeter_status.config(text="Scanning...", foreground="blue")
-        
-        threading.Thread(
-            target=self._run_scan,
-            daemon=True
-        ).start()
-    
-    def _run_scan(self):
-        """Run colorimeter scan in background."""
-        try:
-            detected = self.argyll.initialize_colorimeter()
-            
-            self.root.after(0, lambda: self._on_scan_complete(detected))
-        except Exception as e:
-            self.scan_error = str(e)
-            self.root.after(0, lambda: self._on_scan_complete(False))
-    
-    def _on_scan_complete(self, detected: bool):
-        """Handle scan completion."""
-        self.is_scanning = False
-        self.scan_btn.config(state=tk.NORMAL)
-        
-        if detected:
+        # Check if already connected
+        if self.colorimeter_connected.get():
             self.colorimeter_detected = True
             self.colorimeter_status.config(
-                text="✓ Spyder X2 Ultra detected",
+                text="✓ Colorimeter detected and ready",
                 foreground="green"
             )
         else:
-            self.scan_error = "Colorimeter not found.\nPlease check USB connection."
-            self.colorimeter_status.config(
-                text=self.scan_error,
-                foreground="red"
+            # Start auto-detection polling
+            self._start_colorimeter_polling()
+    
+    def _start_colorimeter_polling(self):
+        """Start polling for colorimeter in wizard."""
+        if self.step != 1:
+            return
+        
+        try:
+            # Quick USB check
+            import subprocess
+            result = subprocess.run(
+                ["lsusb", "-d", "0971:"],
+                capture_output=True,
+                text=True,
+                timeout=1
             )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                self.colorimeter_detected = True
+                self.colorimeter_status.config(
+                    text="✓ Colorimeter detected and ready",
+                    foreground="green"
+                )
+                return
+            
+            # Check X-Rite
+            result = subprocess.run(
+                ["lsusb", "-d", "03eb:"],
+                capture_output=True,
+                text=True,
+                timeout=1
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                self.colorimeter_detected = True
+                self.colorimeter_status.config(
+                    text="✓ Colorimeter detected and ready",
+                    foreground="green"
+                )
+                return
+            
+            # Not found, poll again in 1 second
+            self.dialog.after(1000, self._start_colorimeter_polling)
+            
+        except Exception as e:
+            print(f"[Wizard] Polling error: {e}")
+            self.dialog.after(2000, self._start_colorimeter_polling)
     
     def _show_display(self):
         """Show display selection screen."""
