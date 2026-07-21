@@ -6,12 +6,14 @@ Solution: Run a brief dispread measurement first to wake up the sensor.
 
 import subprocess
 import os
+import sys
 import shutil
+import platform
 from typing import Optional, Tuple, List
 
 
 class ArgyllCMS:
-    """Wrapper for ArgyllCMS command-line tools with Linux support."""
+    """Wrapper for ArgyllCMS command-line tools with cross-platform support."""
     
     def __init__(self, argyll_path: Optional[str] = None):
         """
@@ -25,21 +27,31 @@ class ArgyllCMS:
             self.argyll_path = argyll_path
         else:
             self.argyll_path = self._find_argyll_path()
+        
+        self._is_macos = platform.system() == "Darwin"
+        self._is_linux = platform.system() == "Linux"
     
     def _find_argyll_path(self) -> str:
-        """Find ArgyllCMS installation path on Linux."""
-        # Common Linux installation paths
-        common_paths = [
-            "/usr/bin",
-            "/usr/local/bin",
-            "/opt/argyllcms/bin",
-            os.path.expanduser("~/argyllcms/bin"),
-        ]
-        
+        """Find ArgyllCMS installation path."""
         # Check if dispcal is in PATH
         dispcal_path = shutil.which("dispcal")
         if dispcal_path:
             return os.path.dirname(dispcal_path)
+        
+        # Common installation paths
+        if self._is_macos:
+            common_paths = [
+                "/opt/homebrew/bin",
+                "/usr/local/bin",
+                os.path.expanduser("~/argyllcms/bin"),
+            ]
+        else:  # Linux
+            common_paths = [
+                "/usr/bin",
+                "/usr/local/bin",
+                "/opt/argyllcms/bin",
+                os.path.expanduser("~/argyllcms/bin"),
+            ]
         
         # Check common paths
         for path in common_paths:
@@ -82,6 +94,164 @@ class ArgyllCMS:
             return f"Error: {command} timed out after {timeout}s"
         except Exception as e:
             return f"Error running {command}: {str(e)}"
+    
+    # Cross-Platform USB Detection
+    
+    def detect_colorimeter_usb(self) -> Tuple[bool, str]:
+        """
+        Detect colorimeter via USB (cross-platform).
+        
+        Returns:
+            Tuple of (connected, device_name)
+        """
+        try:
+            if self._is_macos:
+                return self._detect_usb_macos()
+            else:
+                return self._detect_usb_linux()
+        except Exception as e:
+            print(f"[ArgyllCMS] USB detection error: {e}")
+            return False, "Not connected"
+    
+    def _detect_usb_macos(self) -> Tuple[bool, str]:
+        """Detect USB colorimeter on macOS using ioreg."""
+        try:
+            result = subprocess.run(
+                ["ioreg", "-p", "IOUSB", "-l"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            output = result.stdout
+            
+            # Check for Spyder X2 Ultra (Datacolor vendor)
+            if "Datacolor" in output and "Spyder" in output:
+                return True, "Spyder X2 Ultra"
+            
+            # Check for X-Rite devices
+            if "X-Rite" in output or "i1 Display" in output:
+                return True, "X-Rite i1 Display"
+            
+            # Generic colorimeter check
+            if "colorimeter" in output.lower():
+                return True, "Colorimeter Detected"
+            
+            return False, "Not connected"
+            
+        except Exception as e:
+            print(f"[ArgyllCMS] macOS USB check error: {e}")
+            return False, "Not connected"
+    
+    def _detect_usb_linux(self) -> Tuple[bool, str]:
+        """Detect USB colorimeter on Linux using lsusb."""
+        try:
+            # Check for Spyder X2 Ultra (Datacolor vendor ID: 0971)
+            result = subprocess.run(
+                ["lsusb", "-d", "0971:"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                output = result.stdout.strip()
+                if "Spyder" in output or "spyder" in output:
+                    return True, "Spyder X2 Ultra"
+                elif output:
+                    return True, "Colorimeter Detected"
+            
+            # Check for X-Rite devices (vendor ID: 03eb)
+            result = subprocess.run(
+                ["lsusb", "-d", "03eb:"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                output = result.stdout.strip()
+                if "i1" in output.lower() or "x-rite" in output.lower():
+                    return True, "X-Rite i1 Display"
+                elif output:
+                    return True, "Colorimeter Detected"
+            
+            return False, "Not connected"
+            
+        except FileNotFoundError:
+            # lsusb not found, try /sys/bus/usb
+            return self._check_usb_sysfs()
+        except Exception as e:
+            print(f"[ArgyllCMS] Linux USB check error: {e}")
+            return False, "Not connected"
+    
+    def _check_usb_sysfs(self) -> Tuple[bool, str]:
+        """Check USB via /sys/bus/usb/devices (Linux fallback)."""
+        try:
+            usb_path = "/sys/bus/usb/devices"
+            if os.path.exists(usb_path):
+                for device in os.listdir(usb_path):
+                    device_file = os.path.join(usb_path, device, "idVendor")
+                    if os.path.exists(device_file):
+                        with open(device_file, 'r') as f:
+                            vendor_id = f.read().strip()
+                            if vendor_id in ["0971", "03eb"]:  # Datacolor or X-Rite
+                                return True, "Colorimeter Detected"
+        except Exception:
+            pass
+        
+        return False, "Not connected"
+    
+    def detect_colorimeter_argyll(self) -> Tuple[bool, str]:
+        """
+        Detect colorimeter via ArgyllCMS dispcal output.
+        
+        This is the most reliable method as it checks what ArgyllCMS can see.
+        
+        Returns:
+            Tuple of (connected, device_name)
+        """
+        try:
+            # Run dispcal with invalid args to get instrument list
+            result = self._run("dispcal", ["-v"], timeout=5)
+            
+            # Parse output for instrument list
+            for line in result.splitlines():
+                line_lower = line.lower()
+                
+                # Look for instrument list format: "1 = 'usb17: (Datacolor SpyderX2)'"
+                if "= 'usb" in line or "= '/dev/cu" in line:
+                    if "spyder" in line_lower:
+                        return True, "Spyder X2 Ultra"
+                    elif "i1" in line_lower or "x-rite" in line_lower:
+                        return True, "X-Rite i1 Display"
+                    elif "colorimeter" in line_lower or "instrument" in line_lower:
+                        return True, "Colorimeter Detected"
+            
+            return False, "Not connected"
+            
+        except Exception as e:
+            print(f"[ArgyllCMS] Argyll detection error: {e}")
+            return False, "Not connected"
+    
+    def check_instrument_available(self) -> bool:
+        """
+        Check if any instrument is available via ArgyllCMS.
+        
+        Returns:
+            True if an instrument is detected
+        """
+        try:
+            result = self._run("dispcal", ["-v"], timeout=5)
+            
+            # Check for instrument list
+            if "usb" in result.lower() and "=" in result:
+                return True
+            
+            return False
+            
+        except Exception:
+            return False
     
     # Display Detection
     
