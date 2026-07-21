@@ -1,7 +1,7 @@
 """Calibrex - Adaptive Display Calibration GUI for Linux
 
-A system tray application for display calibration using ArgyllCMS.
-Minimizes to menu bar with real-time colorimeter detection.
+Full GUI on startup, minimizes to system tray on close/minimize.
+Features real-time colorimeter detection.
 """
 
 import tkinter as tk
@@ -17,135 +17,147 @@ from .argyllcms import ArgyllCMS
 from . import __version__
 
 
-class CalibrexTray:
-    """System tray application for Calibrex."""
+class CalibrexApp:
+    """Main application - shows full GUI, minimizes to tray."""
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.withdraw()  # Hide main window
+        self.root.title("Calibrex")
+        self.root.geometry("350x600")
+        self.root.resizable(False, False)
         
-        # Initialize ArgyllCMS wrapper
+        # Initialize ArgyllCMS
         self.argyll = ArgyllCMS()
         self._is_macos = platform.system() == "Darwin"
         
-        # State
+        # State variables
+        self.current_lux = tk.DoubleVar(value=0)
+        self.current_color_temp = tk.DoubleVar(value=6500)
+        self.current_brightness = tk.DoubleVar(value=50)
+        self.last_delta_e = tk.DoubleVar(value=0)
+        self.night_shift_enabled = tk.BooleanVar(value=False)
+        self.true_tone_enabled = tk.BooleanVar(value=False)
+        self.adaptive_enabled = tk.BooleanVar(value=True)
+        
+        # Colorimeter state
         self.colorimeter_connected = False
-        self.colorimeter_name = "Not connected"
+        self.colorimeter_name = tk.StringVar(value="Not connected")
+        self.colorimeter_status_text = tk.StringVar(value="Searching...")
+        
+        # Tray state
         self._detection_running = True
-        self._colorimeter_initialized = False
+        self._tray_window = None
+        self._tray_icon = None
+        self._minimized_to_tray = False
         
-        # Create tray icon window (small, hidden)
-        self._create_tray_icon()
+        # Setup UI
+        self._setup_ui()
         
-        # Create popup menu
-        self._create_menu()
+        # Handle minimize to tray
+        self.root.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
+        self.root.bind("<Unmap>", self._on_minimize)
         
         # Start detection
         self._start_detection()
-        
-        # Cleanup on close
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
     
-    def _create_tray_icon(self):
-        """Create the system tray icon."""
-        # Use a small canvas as the tray icon
-        self.tray_window = tk.Toplevel(self.root)
-        self.tray_window.overrideredirect(True)  # No window decorations
-        self.tray_window.geometry("22x22+100+100")  # Small icon
-        self.tray_window.attributes("-topmost", True)
+    def _setup_ui(self):
+        """Setup the full GUI."""
+        main_frame = ttk.Frame(self.root, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Draw icon
-        self.tray_canvas = tk.Canvas(
-            self.tray_window, 
-            width=20, 
-            height=20,
-            bg="#333333",
-            highlightthickness=0
-        )
-        self.tray_canvas.pack()
+        # Header
+        header_frame = ttk.Frame(main_frame)
+        header_frame.pack(fill=tk.X, pady=(0, 10))
         
-        # Draw the Calibrex icon (half-filled circle)
-        self.tray_canvas.create_oval(2, 2, 18, 18, fill="#007AFF", outline="")
-        self.tray_canvas.create_arc(2, 2, 18, 18, fill="#333333", outline="", start=90, extent=180)
+        ttk.Label(header_frame, text="◐", font=("Helvetica", 24)).pack(side=tk.LEFT)
         
-        # Make icon draggable
-        self.tray_canvas.bind("<Button-1>", self._on_icon_click)
-        self.tray_canvas.bind("<B1-Motion>", self._on_icon_drag)
+        title_frame = ttk.Frame(header_frame)
+        title_frame.pack(side=tk.LEFT, padx=10)
         
-        # Right-click for menu
-        self.tray_canvas.bind("<Button-3>", self._show_menu)
-        self.tray_canvas.bind("<Button-2>", self._show_menu)  # Middle click too
+        ttk.Label(title_frame, text="Calibrex", font=("Helvetica", 16, "bold")).pack(anchor=tk.W)
+        ttk.Label(title_frame, text="Adaptive Display Calibration", font=("Helvetica", 9), foreground="gray").pack(anchor=tk.W)
         
-        # Position in top-right corner (menu bar area)
-        self.root.update_idletasks()
-        screen_width = self.root.winfo_screenwidth()
-        self.tray_window.geometry(f"22x22+{screen_width - 30}+5")
-    
-    def _create_menu(self):
-        """Create the popup menu."""
-        self.menu = tk.Menu(self.root, tearoff=0)
+        ttk.Label(header_frame, text=f"v{__version__}", font=("Helvetica", 8), foreground="gray").pack(side=tk.RIGHT)
+        
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         
         # Colorimeter status
-        self.menu.add_command(
-            label="Colorimeter: Not connected",
-            state=tk.DISABLED
-        )
-        self.menu.add_separator()
+        colorimeter_frame = ttk.LabelFrame(main_frame, text="Colorimeter", padding=8)
+        colorimeter_frame.pack(fill=tk.X, pady=5)
         
-        # Actions
-        self.menu.add_command(
-            label="Calibrate Now",
-            command=self._open_calibration
-        )
-        self.menu.add_command(
-            label="Spot Check",
-            command=self._spot_check
-        )
-        self.menu.add_separator()
+        device_frame = ttk.Frame(colorimeter_frame)
+        device_frame.pack(fill=tk.X)
+        
+        self.device_indicator = tk.Canvas(device_frame, width=12, height=12, highlightthickness=0)
+        self.device_indicator.pack(side=tk.LEFT, padx=(0, 8))
+        self._draw_indicator("gray")
+        
+        ttk.Label(device_frame, textvariable=self.colorimeter_name, font=("Helvetica", 10, "bold")).pack(side=tk.LEFT)
+        
+        self.status_label = ttk.Label(colorimeter_frame, textvariable=self.colorimeter_status_text,
+                                       font=("Helvetica", 9), foreground="gray")
+        self.status_label.pack(anchor=tk.W, pady=(4, 0))
+        
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
+        # Readings
+        status_frame = ttk.LabelFrame(main_frame, text="Readings", padding=8)
+        status_frame.pack(fill=tk.X, pady=5)
+        
+        self._create_status_row(status_frame, "☀ Ambient Light", self.current_lux, "lux")
+        self._create_status_row(status_frame, "🌡 Color Temp", self.current_color_temp, "K")
+        self._create_status_row(status_frame, "◐ Brightness", self.current_brightness, "%")
+        self._create_status_row(status_frame, "📊 Accuracy", self.last_delta_e, "dE")
+        
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         
         # Settings
-        self.menu.add_command(
-            label="Settings",
-            command=self._open_settings
-        )
-        self.menu.add_separator()
+        settings_frame = ttk.LabelFrame(main_frame, text="Settings", padding=8)
+        settings_frame.pack(fill=tk.X, pady=5)
         
-        # Quit
-        self.menu.add_command(
-            label="Quit Calibrex",
-            command=self._on_close
-        )
-    
-    def _on_icon_click(self, event):
-        """Handle icon click."""
-        pass  # Could show/hide window
-    
-    def _on_icon_drag(self, event):
-        """Handle icon drag."""
-        x = self.tray_window.winfo_x() + event.x
-        y = self.tray_window.winfo_y() + event.y
-        self.tray_window.geometry(f"+{x}+{y}")
-    
-    def _show_menu(self, event):
-        """Show the popup menu."""
-        # Update menu items
-        self.menu.entryconfigure(
-            0, 
-            label=f"Colorimeter: {self.colorimeter_name}"
-        )
+        ttk.Checkbutton(settings_frame, text="🌙 Night Shift", variable=self.night_shift_enabled).pack(anchor=tk.W)
+        ttk.Checkbutton(settings_frame, text="☀ True Tone", variable=self.true_tone_enabled).pack(anchor=tk.W)
+        ttk.Checkbutton(settings_frame, text="🔄 Adaptive Mode", variable=self.adaptive_enabled).pack(anchor=tk.W)
         
-        # Show menu at icon position
-        self.menu.post(event.x_root, event.y_root)
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
+        # Actions
+        actions_frame = ttk.Frame(main_frame)
+        actions_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(actions_frame, text="🎯 Calibrate Now", command=self._open_calibration_wizard).pack(fill=tk.X, pady=2)
+        ttk.Button(actions_frame, text="✓ Spot Check", command=self._spot_check).pack(fill=tk.X, pady=2)
+        ttk.Button(actions_frame, text="⚙ Settings", command=self._open_settings).pack(fill=tk.X, pady=2)
+        
+        ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
+        # Minimize to tray button
+        ttk.Button(main_frame, text="⬇ Minimize to Tray", command=self._minimize_to_tray).pack(fill=tk.X, pady=2)
+        ttk.Button(main_frame, text="Quit", command=self._quit).pack(fill=tk.X, pady=2)
+    
+    def _draw_indicator(self, color: str):
+        """Draw connection indicator."""
+        self.device_indicator.delete("all")
+        self.device_indicator.create_oval(2, 2, 10, 10, fill=color, outline="")
+    
+    def _create_status_row(self, parent, label: str, var: tk.DoubleVar, unit: str):
+        """Create status row."""
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, pady=2)
+        
+        ttk.Label(frame, text=label, font=("Helvetica", 9)).pack(side=tk.LEFT)
+        
+        value_label = ttk.Label(frame, text=f"{int(var.get())} {unit}", font=("Helvetica", 9), foreground="gray")
+        value_label.pack(side=tk.RIGHT)
+        
+        var.trace_add("write", lambda *args: value_label.config(text=f"{int(var.get())} {unit}"))
     
     def _start_detection(self):
-        """Start background detection thread."""
-        threading.Thread(
-            target=self._detection_loop,
-            daemon=True
-        ).start()
+        """Start detection thread."""
+        threading.Thread(target=self._detection_loop, daemon=True).start()
     
     def _detection_loop(self):
-        """Background loop to detect colorimeter."""
+        """Background detection loop."""
         last_state = None
         
         while self._detection_running:
@@ -155,53 +167,40 @@ class CalibrexTray:
                 if connected != last_state:
                     last_state = connected
                     self.colorimeter_connected = connected
-                    self.colorimeter_name = name
+                    self.colorimeter_name.set(name if connected else "Not connected")
+                    self.colorimeter_status_text.set("Ready" if connected else "Searching...")
                     
-                    # Update tray icon color
-                    color = "#4CAF50" if connected else "#F44336"  # Green/Red
-                    self.root.after(0, lambda c=color: self._update_icon_color(c))
-                
+                    color = "#4CAF50" if connected else "#F44336"
+                    self.root.after(0, lambda c=color: self._draw_indicator(c))
+                    
             except Exception as e:
                 print(f"[Detection] Error: {e}")
             
-            # Poll every 2 seconds
             for _ in range(20):
                 if not self._detection_running:
                     return
                 time.sleep(0.1)
     
-    def _update_icon_color(self, color: str):
-        """Update the tray icon color."""
-        try:
-            self.tray_canvas.delete("all")
-            self.tray_canvas.create_oval(2, 2, 18, 18, fill=color, outline="")
-            self.tray_canvas.create_arc(2, 2, 18, 18, fill="#333333", outline="", start=90, extent=180)
-        except Exception:
-            pass
-    
     def _detect_colorimeter(self) -> Tuple[bool, str]:
-        """Detect colorimeter using multiple methods."""
-        # Method 1: Check via ArgyllCMS (most reliable)
+        """Detect colorimeter."""
+        # Method 1: ArgyllCMS
         try:
             result = subprocess.run(
                 [os.path.join(self.argyll.argyll_path, "dispcal"), "-v"],
-                capture_output=True,
-                text=True,
-                timeout=3
+                capture_output=True, text=True, timeout=3
             )
             
             for line in result.stdout.splitlines():
-                if "= 'usb" in line or "Spyder" in line or "i1" in line:
+                if "= 'usb" in line:
                     if "Spyder" in line:
                         return True, "Spyder X2 Ultra"
                     elif "i1" in line:
                         return True, "X-Rite i1 Display"
-                    elif "usb" in line:
-                        return True, "Colorimeter Detected"
+                    return True, "Colorimeter Detected"
         except Exception:
             pass
         
-        # Method 2: Check USB directly
+        # Method 2: USB
         try:
             if self._is_macos:
                 return self._detect_usb_macos()
@@ -213,45 +212,25 @@ class CalibrexTray:
         return False, "Not connected"
     
     def _detect_usb_macos(self) -> Tuple[bool, str]:
-        """Detect USB colorimeter on macOS."""
+        """Detect USB on macOS."""
         try:
-            result = subprocess.run(
-                ["ioreg", "-p", "IOUSB", "-l"],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
-            
-            output = result.stdout
-            if "Datacolor" in output and "Spyder" in output:
+            result = subprocess.run(["ioreg", "-p", "IOUSB", "-l"], capture_output=True, text=True, timeout=2)
+            if "Datacolor" in result.stdout and "Spyder" in result.stdout:
                 return True, "Spyder X2 Ultra"
-            if "X-Rite" in output:
+            if "X-Rite" in result.stdout:
                 return True, "X-Rite i1 Display"
-            
             return False, "Not connected"
         except Exception:
             return False, "Not connected"
     
     def _detect_usb_linux(self) -> Tuple[bool, str]:
-        """Detect USB colorimeter on Linux."""
+        """Detect USB on Linux."""
         try:
-            # Check Datacolor (0971)
-            result = subprocess.run(
-                ["lsusb", "-d", "0971:"],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
+            result = subprocess.run(["lsusb", "-d", "0971:"], capture_output=True, text=True, timeout=2)
             if result.returncode == 0 and result.stdout.strip():
                 return True, "Spyder X2 Ultra"
             
-            # Check X-Rite (03eb)
-            result = subprocess.run(
-                ["lsusb", "-d", "03eb:"],
-                capture_output=True,
-                text=True,
-                timeout=2
-            )
+            result = subprocess.run(["lsusb", "-d", "03eb:"], capture_output=True, text=True, timeout=2)
             if result.returncode == 0 and result.stdout.strip():
                 return True, "X-Rite i1 Display"
             
@@ -262,64 +241,121 @@ class CalibrexTray:
             return False, "Not connected"
     
     def _check_usb_sysfs(self) -> Tuple[bool, str]:
-        """Check USB via /sys/bus/usb/devices."""
+        """Check /sys/bus/usb."""
         try:
-            usb_path = "/sys/bus/usb/devices"
-            if os.path.exists(usb_path):
-                for device in os.listdir(usb_path):
-                    vendor_file = os.path.join(usb_path, device, "idVendor")
-                    if os.path.exists(vendor_file):
-                        with open(vendor_file, 'r') as f:
-                            vendor = f.read().strip()
-                            if vendor in ["0971", "03eb"]:
-                                return True, "Colorimeter Detected"
+            for device in os.listdir("/sys/bus/usb/devices"):
+                vendor_file = f"/sys/bus/usb/devices/{device}/idVendor"
+                if os.path.exists(vendor_file):
+                    with open(vendor_file) as f:
+                        if f.read().strip() in ["0971", "03eb"]:
+                            return True, "Colorimeter Detected"
         except Exception:
             pass
         return False, "Not connected"
     
-    def _open_calibration(self):
-        """Open calibration wizard."""
-        CalibrationWizard(self.root, self.argyll, self.colorimeter_connected)
+    def _on_minimize(self, event):
+        """Handle window minimize."""
+        if self.root.state() == "iconic":
+            self.root.after(100, self._minimize_to_tray)
+    
+    def _minimize_to_tray(self):
+        """Minimize window to system tray."""
+        if self._minimized_to_tray:
+            return
+        
+        self._minimized_to_tray = True
+        self.root.withdraw()  # Hide main window
+        self._create_tray_icon()
+    
+    def _create_tray_icon(self):
+        """Create system tray icon."""
+        self._tray_window = tk.Toplevel(self.root)
+        self._tray_window.overrideredirect(True)
+        self._tray_window.attributes("-topmost", True)
+        
+        # Position in top-right
+        screen_width = self.root.winfo_screenwidth()
+        self._tray_window.geometry(f"24x24+{screen_width - 40}+8")
+        
+        # Icon canvas
+        self._tray_icon = tk.Canvas(self._tray_window, width=22, height=22, bg="#333", highlightthickness=0)
+        self._tray_icon.pack()
+        
+        # Draw icon
+        color = "#4CAF50" if self.colorimeter_connected else "#007AFF"
+        self._tray_icon.create_oval(2, 2, 20, 20, fill=color, outline="")
+        self._tray_icon.create_arc(2, 2, 20, 20, fill="#333", outline="", start=90, extent=180)
+        
+        # Bindings
+        self._tray_icon.bind("<Button-1>", self._restore_from_tray)
+        self._tray_icon.bind("<Button-3>", self._show_tray_menu)
+        self._tray_icon.bind("<Button-2>", self._show_tray_menu)
+    
+    def _restore_from_tray(self, event=None):
+        """Restore window from tray."""
+        if not self._minimized_to_tray:
+            return
+        
+        self._minimized_to_tray = False
+        
+        if self._tray_window:
+            self._tray_window.destroy()
+            self._tray_window = None
+        
+        self.root.deiconify()  # Show window
+        self.root.lift()
+        self.root.focus_force()
+    
+    def _show_tray_menu(self, event):
+        """Show tray context menu."""
+        menu = tk.Menu(self.root, tearoff=0)
+        
+        menu.add_command(label=f"Colorimeter: {self.colorimeter_name.get()}", state=tk.DISABLED)
+        menu.add_separator()
+        menu.add_command(label="Open Calibrex", command=self._restore_from_tray)
+        menu.add_command(label="Calibrate Now", command=self._open_calibration_wizard)
+        menu.add_command(label="Spot Check", command=self._spot_check)
+        menu.add_separator()
+        menu.add_command(label="Quit", command=self._quit)
+        
+        menu.post(event.x_root, event.y_root)
     
     def _spot_check(self):
         """Run spot check."""
-        threading.Thread(
-            target=self._run_spot_check,
-            daemon=True
-        ).start()
+        threading.Thread(target=self._run_spot_check, daemon=True).start()
     
     def _run_spot_check(self):
         """Run spot check in background."""
         try:
             valid, x, y, Y = self.argyll.spot_read()
             if valid:
-                self.root.after(0, lambda: messagebox.showinfo(
-                    "Spot Check",
-                    "Delta-E: 1.2\nExcellent calibration!"
-                ))
+                self.root.after(0, lambda: messagebox.showinfo("Spot Check", "Delta-E: 1.2\nExcellent!"))
             else:
-                self.root.after(0, lambda: messagebox.showwarning(
-                    "Spot Check",
-                    "Could not take reading.\nMake sure colorimeter is connected."
-                ))
+                self.root.after(0, lambda: messagebox.showwarning("Spot Check", "Could not read.\nCheck colorimeter."))
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror(
-                "Error", f"Spot check failed: {str(e)}"
-            ))
+            self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+    
+    def _open_calibration_wizard(self):
+        """Open calibration wizard."""
+        self._restore_from_tray()  # Make sure main window is visible
+        CalibrationWizard(self.root, self.argyll, self.colorimeter_connected)
     
     def _open_settings(self):
         """Open settings."""
         SettingsDialog(self.root)
     
-    def _on_close(self):
+    def _quit(self):
         """Quit application."""
         self._detection_running = False
-        self.tray_window.destroy()
+        
+        if self._tray_window:
+            self._tray_window.destroy()
+        
         self.root.quit()
         self.root.destroy()
     
     def run(self):
-        """Start the application."""
+        """Start application."""
         self.root.mainloop()
 
 
@@ -337,7 +373,6 @@ class CalibrationWizard:
         self.progress = 0
         self.colorimeter_detected = colorimeter_connected
         
-        # Create dialog
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Calibration Wizard")
         self.dialog.geometry("600x500")
@@ -348,8 +383,7 @@ class CalibrationWizard:
         self._update_content()
     
     def _setup_ui(self):
-        """Setup wizard UI."""
-        # Progress bar
+        """Setup wizard."""
         progress_frame = ttk.Frame(self.dialog, padding=10)
         progress_frame.pack(fill=tk.X)
         
@@ -361,13 +395,11 @@ class CalibrationWizard:
         
         ttk.Separator(self.dialog, orient=tk.HORIZONTAL).pack(fill=tk.X)
         
-        # Content
         self.content_frame = ttk.Frame(self.dialog, padding=20)
         self.content_frame.pack(fill=tk.BOTH, expand=True)
         
         ttk.Separator(self.dialog, orient=tk.HORIZONTAL).pack(fill=tk.X)
         
-        # Navigation
         nav_frame = ttk.Frame(self.dialog, padding=10)
         nav_frame.pack(fill=tk.X)
         
@@ -377,51 +409,37 @@ class CalibrationWizard:
         self.next_btn.pack(side=tk.RIGHT, padx=5)
     
     def _update_progress_bars(self):
-        """Update progress bars."""
         for i, bar in enumerate(self.progress_bars):
             bar.delete("all")
             color = "#007AFF" if i <= self.step else "#E0E0E0"
             bar.create_rectangle(0, 0, 1000, 4, fill=color, outline="")
     
     def _clear_content(self):
-        """Clear content frame."""
         for widget in self.content_frame.winfo_children():
             widget.destroy()
     
     def _update_content(self):
-        """Update content for current step."""
         self._clear_content()
         self._update_progress_bars()
         
-        steps = [
-            self._show_welcome,
-            self._show_colorimeter,
-            self._show_display,
-            self._show_measurement,
-            self._show_profile,
-            self._show_verification,
-            self._show_complete
-        ]
+        steps = [self._show_welcome, self._show_colorimeter, self._show_display,
+                 self._show_measurement, self._show_profile, self._show_verification, self._show_complete]
         
         if 0 <= self.step < len(steps):
             steps[self.step]()
         
-        self.next_btn.config(
-            text="Done" if self.step == self.max_step else
-                 "Finish" if self.step == 5 else "Continue"
-        )
+        self.next_btn.config(text="Done" if self.step == self.max_step else "Finish" if self.step == 5 else "Continue")
     
     def _show_welcome(self):
         ttk.Label(self.content_frame, text="🎯", font=("Helvetica", 48)).pack(pady=10)
         ttk.Label(self.content_frame, text="Display Calibration", font=("Helvetica", 18, "bold")).pack(pady=5)
-        ttk.Label(self.content_frame, text="Guide you through calibrating your display.", 
-                  font=("Helvetica", 10), foreground="gray").pack(pady=10)
+        ttk.Label(self.content_frame, text="Guide you through calibrating your display.", font=("Helvetica", 10), foreground="gray").pack(pady=10)
     
     def _show_colorimeter(self):
         ttk.Label(self.content_frame, text="🔌", font=("Helvetica", 40)).pack(pady=10)
         ttk.Label(self.content_frame, text="Connect Colorimeter", font=("Helvetica", 16, "bold")).pack(pady=5)
         
-        status = "✓ Colorimeter ready" if self.colorimeter_detected else "Checking..."
+        status = "✓ Ready" if self.colorimeter_detected else "Checking..."
         color = "green" if self.colorimeter_detected else "gray"
         self.status_label = ttk.Label(self.content_frame, text=status, font=("Helvetica", 10), foreground=color)
         self.status_label.pack(pady=10)
@@ -430,21 +448,16 @@ class CalibrationWizard:
             self._poll_colorimeter()
     
     def _poll_colorimeter(self):
-        """Poll for colorimeter."""
         if self.step != 1 or not self.dialog.winfo_exists():
             return
         
         try:
-            result = subprocess.run(
-                [os.path.join(self.argyll.argyll_path, "dispcal"), "-v"],
-                capture_output=True, text=True, timeout=2
-            )
-            
+            result = subprocess.run([os.path.join(self.argyll.argyll_path, "dispcal"), "-v"],
+                                   capture_output=True, text=True, timeout=2)
             if "usb" in result.stdout.lower():
                 self.colorimeter_detected = True
-                self.status_label.config(text="✓ Colorimeter ready", foreground="green")
+                self.status_label.config(text="✓ Ready", foreground="green")
                 return
-            
             self.dialog.after(1000, self._poll_colorimeter)
         except Exception:
             self.dialog.after(2000, self._poll_colorimeter)
@@ -452,8 +465,7 @@ class CalibrationWizard:
     def _show_display(self):
         ttk.Label(self.content_frame, text="🖥", font=("Helvetica", 40)).pack(pady=10)
         ttk.Label(self.content_frame, text="Display Selection", font=("Helvetica", 16, "bold")).pack(pady=5)
-        ttk.Label(self.content_frame, text="Center colorimeter on screen.\nKeep display at normal brightness.",
-                  font=("Helvetica", 10), foreground="gray").pack(pady=10)
+        ttk.Label(self.content_frame, text="Center colorimeter on screen.\nKeep display at normal brightness.", font=("Helvetica", 10), foreground="gray").pack(pady=10)
     
     def _show_measurement(self):
         if self.is_measuring:
@@ -485,19 +497,18 @@ class CalibrationWizard:
     def _show_profile(self):
         ttk.Label(self.content_frame, text="📄", font=("Helvetica", 40)).pack(pady=10)
         ttk.Label(self.content_frame, text="Generate Profile", font=("Helvetica", 16, "bold")).pack(pady=5)
-        ttk.Button(self.content_frame, text="Generate", command=lambda: self._next()).pack(pady=10)
+        ttk.Button(self.content_frame, text="Generate", command=self._next).pack(pady=10)
     
     def _show_verification(self):
         ttk.Label(self.content_frame, text="✓", font=("Helvetica", 40)).pack(pady=10)
-        ttk.Label(self.content_frame, text="Verify Calibration", font=("Helvetica", 16, "bold")).pack(pady=5)
+        ttk.Label(self.content_frame, text="Verify", font=("Helvetica", 16, "bold")).pack(pady=5)
         ttk.Label(self.content_frame, text="1.2", font=("Helvetica", 36, "bold"), foreground="green").pack(pady=5)
         ttk.Label(self.content_frame, text="Very Good", font=("Helvetica", 12), foreground="green").pack(pady=5)
     
     def _show_complete(self):
         ttk.Label(self.content_frame, text="✓", font=("Helvetica", 48), foreground="green").pack(pady=10)
         ttk.Label(self.content_frame, text="Done!", font=("Helvetica", 18, "bold")).pack(pady=5)
-        ttk.Label(self.content_frame, text="Display calibrated successfully.", 
-                  font=("Helvetica", 10), foreground="gray").pack(pady=10)
+        ttk.Label(self.content_frame, text="Display calibrated.", font=("Helvetica", 10), foreground="gray").pack(pady=10)
     
     def _next(self):
         self.step = min(self.step + 1, self.max_step)
@@ -523,12 +534,10 @@ class CalibrationWizard:
 
 
 class SettingsDialog:
-    """Settings dialog."""
-    
     def __init__(self, parent):
         self.dialog = tk.Toplevel(parent)
         self.dialog.title("Settings")
-        self.dialog.geometry("400x250")
+        self.dialog.geometry("400x200")
         self.dialog.transient(parent)
         self.dialog.grab_set()
         
@@ -537,8 +546,8 @@ class SettingsDialog:
         frame = ttk.Frame(self.dialog, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
         
-        ttk.Checkbutton(frame, text="Launch at login", variable=tk.BooleanVar(value=True)).pack(anchor=tk.W, pady=2)
-        ttk.Checkbutton(frame, text="Monthly recalibration", variable=tk.BooleanVar(value=True)).pack(anchor=tk.W, pady=2)
+        ttk.Checkbutton(frame, text="Launch at login").pack(anchor=tk.W, pady=2)
+        ttk.Checkbutton(frame, text="Monthly recalibration").pack(anchor=tk.W, pady=2)
         
         ttk.Button(self.dialog, text="Done", command=self._close).pack(pady=10)
     
@@ -552,7 +561,7 @@ class SettingsDialog:
 
 def main():
     """Entry point."""
-    app = CalibrexTray()
+    app = CalibrexApp()
     app.run()
 
 
